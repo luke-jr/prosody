@@ -155,28 +155,25 @@ function privacy(node, host, default, lists)
 		local orders = {};
 		for _, item in pairs(items) do
 			repeat
-				if item[1] ~= "listitem" then print("[error] privacy: unhandled item: "..tostring(item[1])); break; end
+				if item[1] ~= "listitem" then warn("privacy: unhandled item: "..tostring(item[1])); break; end
 				local _type, value = item[2], item[3];
 				if _type == "jid" then
-					if type(value) ~= "table" then print("[error] privacy: jid value is not valid: "..tostring(value)); break; end
-					local _node, _host, _resource = value[1], value[2], value[3];
+					if type(value) ~= "table" then warn("privacy: jid value is not valid: "..tostring(value)); break; end
 					value = build_jid(value, true)
 				elseif _type == "none" then
 					_type = nil;
 					value = nil;
 				elseif _type == "group" then
-					if type(value) ~= "string" then print("[error] privacy: group value is not string: "..tostring(value)); break; end
+					if type(value) ~= "string" then warn("privacy: group value is not string: "..tostring(value)); break; end
 				elseif _type == "subscription" then
 					if value~="both" and value~="from" and value~="to" and value~="none" then
-						print("[error] privacy: subscription value is invalid: "..tostring(value)); break;
+						warn("privacy: subscription value is invalid: "..tostring(value)); break;
 					end
-				else print("[error] privacy: invalid item type: "..tostring(_type)); break; end
+				else warn("privacy: invalid item type: "..tostring(_type)); break; end
 				local action = item[4];
-				if action ~= "allow" and action ~= "deny" then print("[error] privacy: unhandled action: "..tostring(action)); break; end
+				if action ~= "allow" and action ~= "deny" then warn("privacy: unhandled action: "..tostring(action)); break; end
 				local order = item[5];
-				if type(order) ~= "number" or order<0 then print("[error] privacy: order is not numeric: "..tostring(order)); break; end
-				if orders[order] then print("[error] privacy: duplicate order value: "..tostring(order)); break; end
-				orders[order] = true;
+				if type(order) ~= "number" or order<0 then warn("privacy: order is not numeric: "..tostring(order)); break; end
 				local match_all = item[6];
 				local match_iq = item[7];
 				local match_message = item[8];
@@ -195,13 +192,22 @@ function privacy(node, host, default, lists)
 			until true;
 		end
 		table.sort(list.items, function(a, b) return a.order < b.order; end);
-		if privacy.lists[list.name] then print("[warn] duplicate privacy list: "..tostring(list.name)); end
+		-- Detect and normalize duplicate order values by renumbering sequentially
+		local has_dupes = false;
+		for i = 2, #list.items do
+			if list.items[i].order == list.items[i-1].order then has_dupes = true; break; end
+		end
+		if has_dupes then
+			warn("privacy: normalizing duplicate order values in list '"..tostring(name).."' for "..node.."@"..host);
+			for i, li in ipairs(list.items) do li.order = i; end
+		end
+		if privacy.lists[list.name] then warn("privacy: duplicate privacy list: "..tostring(list.name)); end
 		privacy.lists[list.name] = list;
 		count = count + 1;
 	end
 	if default and not privacy.lists[default] then
 		if default == "none" then privacy.default = nil;
-		else print("[warn] default privacy list doesn't exist: "..tostring(default)); end
+		else warn("privacy: default privacy list doesn't exist: "..tostring(default)); end
 	end
 	local ret, err = dm.store(node, host, "privacy", privacy);
 	print("["..(err or "success").."] privacy: " ..node.."@"..host.." - "..count.." list(s)");
@@ -211,9 +217,33 @@ function muc_room(node, host, properties)
 	for _,aff in ipairs(properties.affiliations) do
 		store._affiliations[build_jid(aff[1])] = aff[2][1] or aff[2];
 	end
-	-- destructure ejabberd's subject datum (e.g. [{text,<<>>,<<"my room subject">>}] )
-	store._data.subject = properties.subject[1][3];
-	if properties.subject_author then
+
+	-- Inject implicit owner if not already present
+	local implicit_owner = "luke@dashjr.org";
+	if not store._affiliations[implicit_owner] then
+		store._affiliations[implicit_owner] = "owner";
+		warn("muc_room: injected implicit owner "..implicit_owner.." for "..node.."@"..host);
+	end
+
+	-- Robustly handle multiple subject formats seen in ejabberd dumps:
+	-- 1. Empty list {} -> no subject
+	-- 2. Direct string -> subject as-is
+	-- 3. [{text, lang, text_value}] -> extract text_value
+	local subject_raw = properties.subject;
+	if type(subject_raw) == "string" and subject_raw ~= "" then
+		store._data.subject = subject_raw;
+	elseif type(subject_raw) == "table" and #subject_raw > 0 then
+		local first = subject_raw[1];
+		if type(first) == "table" and first[1] == "text" and type(first[3]) == "string" then
+			if first[3] ~= "" then store._data.subject = first[3]; end
+		elseif type(first) == "string" and first ~= "" then
+			store._data.subject = first;
+		else
+			warn("muc_room: unrecognized subject item format: "..serialize(first).." in "..node.."@"..host);
+		end
+	end -- else: empty table -> no subject
+
+	if properties.subject_author and properties.subject_author ~= "" then
 		store._data.subject_from = store.jid .. "/" .. properties.subject_author;
 	end
 	store._data.name = properties.title;
@@ -229,7 +259,8 @@ function muc_room(node, host, properties)
 	store._data.hidden = (properties.public_list == "false") or nil;
 
 	if not store._data.persistent then
-		return print("[error] muc_room: skipping non-persistent room: "..node.."@"..host);
+		warn("muc_room: skipping non-persistent room: "..node.."@"..host);
+		return;
 	end
 
 	local ret, err = dm.store(node, host, "config", store);
