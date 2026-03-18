@@ -28,6 +28,18 @@ local st = require "util.stanza";
 local dm = require "util.datamanager"
 dm.set_data_path("data");
 
+-- Diagnostics helpers
+local import_warnings = 0;
+local import_errors   = 0;
+local function warn(msg)
+	import_warnings = import_warnings + 1;
+	io.stderr:write("[warn] "..msg.."\n");
+end
+local function fatal(msg)
+	import_errors = import_errors + 1;
+	error("[fatal] "..msg, 2);
+end
+
 function build_stanza(tuple, stanza)
 	assert(type(tuple) == "table", "XML node is of unexpected type: "..type(tuple));
 	if tuple[1] == "xmlelement" or tuple[1] == "xmlel" then
@@ -53,8 +65,15 @@ function build_stanza(tuple, stanza)
 	end
 end
 function build_time(tuple)
-	local Megaseconds,Seconds,Microseconds = unpack(tuple);
-	return Megaseconds * 1000000 + Seconds;
+	local Megaseconds, Seconds, Microseconds = unpack(tuple);
+	if type(Megaseconds) ~= "number" or type(Seconds) ~= "number" then
+		fatal("build_time: unexpected timestamp format: "..serialize(tuple));
+	end
+	local t = Megaseconds * 1000000 + Seconds;
+	if type(Microseconds) == "number" and Microseconds > 0 then
+		t = t + Microseconds / 1000000;
+	end
+	return t;
 end
 function build_jid(tuple, full)
 	local node, jid, resource = tuple[1], tuple[2], tuple[3]
@@ -86,12 +105,17 @@ function password(node, host, password)
 		data.server_key = hex(unb64(password[3]));
 		data.salt = unb64(password[4]);
 		if type(password[6]) == "number" then
-			assert(password[5] == "sha", "unexpected passwd entry hash: "..tostring(password[5]));
+			if password[5] ~= "sha" then
+				fatal("passwd: unexpected SCRAM hash algorithm: "..tostring(password[5]).." for "..node.."@"..host);
+			end
 			data.iteration_count = password[6];
-		else
-			assert(type(password[5]) == "number", "unexpected passwd entry in source data");
+		elseif type(password[5]) == "number" then
 			data.iteration_count = password[5];
+		else
+			fatal("passwd: unexpected SCRAM iteration_count fields for "..node.."@"..host..": "..serialize(password));
 		end
+	else
+		fatal("passwd: unexpected password/auth shape for "..node.."@"..host..": "..serialize(password));
 	end
 	local ret, err = dm.store(node, host, "accounts", data);
 	print("["..(err or "success").."] accounts: "..node.."@"..host);
@@ -116,8 +140,8 @@ function private_storage(node, host, xmlns, stanza)
 	print("["..(err or "success").."] private: " ..node.."@"..host.." - "..xmlns);
 end
 function offline_msg(node, host, t, stanza)
-	stanza.attr.stamp = os.date("!%Y-%m-%dT%H:%M:%SZ", t);
-	stanza.attr.stamp_legacy = os.date("!%Y%m%dT%H:%M:%S", t);
+	stanza.attr.stamp = os.date("!%Y-%m-%dT%H:%M:%SZ", math.floor(t));
+	stanza.attr.stamp_legacy = os.date("!%Y%m%dT%H:%M:%S", math.floor(t));
 	local ret, err = dm.list_append(node, host, "offline", st.preserialize(stanza));
 	print("["..(err or "success").."] offline: " ..node.."@"..host.." - "..os.date("!%Y-%m-%dT%H:%M:%SZ", t));
 end
@@ -323,6 +347,10 @@ for item in erlparse.parseFile(arg) do
 	local name = item[1];
 	t[name] = (t[name] or 0) + 1;
 	--print(count, serialize(item));
-	if filters[name] then filters[name](item); end
+	if filters[name] then
+		local ok, err = pcall(filters[name], item);
+		if not ok then io.stderr:write(tostring(err).."\n"); end
+	end
 end
+print(("\nImport complete: %d records processed, %d warnings, %d errors."):format(count, import_warnings, import_errors));
 --print(serialize(t));
