@@ -275,6 +275,68 @@ function muc_room(node, host, properties)
 	print("["..(err or "success").."] muc_room: " ..node.."@"..host);
 end
 
+-- Table tracking rooms whose mam config says disabled, used for cross-check warnings
+local muc_mam_disabled = {};
+
+function archive_msg(us_node, us_host, id, t, peer, bare_peer, packet, nick, msg_type)
+	-- msg_type is "chat" (personal MAM) or "groupchat" (MUC MAM / muc_log)
+	local stanza = build_stanza(packet);
+	local when = t;
+	local item = st.preserialize(stanza);
+	item.when = when;
+	item.attr.stamp = os.date("!%Y-%m-%dT%H:%M:%SZ", math.floor(when));
+
+	local store_user, store_host, store_name;
+	if msg_type == "groupchat" then
+		-- MUC MAM: stored by room node under muc_log
+		store_user = us_node;
+		store_host = us_host;
+		store_name = "muc_log";
+		if muc_mam_disabled[us_node.."@"..us_host] then
+			warn("archive_msg: room "..us_node.."@"..us_host.." has mam=false but archive data exists; importing anyway");
+			muc_mam_disabled[us_node.."@"..us_host] = nil; -- warn once
+		end
+		-- 'with' for MUC archive is the sender's full JID
+		item.with = build_jid(peer, true);
+	else
+		-- Personal MAM: stored under the user's archive store
+		store_user = us_node;
+		store_host = us_host;
+		store_name = "archive";
+		item.with = build_jid(bare_peer, false);
+	end
+
+	item.key = id ~= "" and id or nil; -- use ejabberd id as key when available
+
+	local ret, err = dm.list_append(store_user, store_host, store_name, item);
+	print("["..(err or "success").."] archive_msg("..msg_type.."): "..store_user.."@"..store_host.." id="..tostring(id));
+end
+
+function archive_prefs(node, host, default_policy, always_jids, never_jids)
+	-- default_policy is ejabberd atom: "always", "never", or "roster"
+	local prefs = {};
+	if default_policy == "always" then
+		prefs[false] = true;
+	elseif default_policy == "roster" then
+		prefs[false] = "roster";
+	else -- "never" or unknown -> never
+		if default_policy ~= "never" then
+			warn("archive_prefs: unknown default policy '"..tostring(default_policy).."' for "..node.."@"..host.."; treating as never");
+		end
+		prefs[false] = false;
+	end
+	for _, jid_tuple in ipairs(always_jids) do
+		local jid = build_jid(jid_tuple, true);
+		if jid then prefs[jid] = true; end
+	end
+	for _, jid_tuple in ipairs(never_jids) do
+		local jid = build_jid(jid_tuple, true);
+		if jid then prefs[jid] = false; end
+	end
+	local ret, err = dm.store(node, host, "archive_prefs", prefs);
+	print("["..(err or "success").."] archive_prefs: "..node.."@"..host);
+end
+
 
 local filters = {
 	passwd = function(tuple)
@@ -325,7 +387,39 @@ local filters = {
 				properties[pair[1]] = pair[2];
 			end
 		end
+		-- Track rooms with mam disabled for cross-check in archive_msg
+		if properties.mam == "false" then
+			local room_jid = tuple[2][1].."@"..tuple[2][2];
+			muc_mam_disabled[room_jid] = true;
+		end
 		muc_room(tuple[2][1], tuple[2][2], properties);
+	end;
+	archive_msg = function(tuple)
+		-- {archive_msg, {User,Host}, Id, Timestamp, Peer, BarePeer, Packet, Nick, Type}
+		local us = tuple[2];
+		if type(us) ~= "table" then fatal("archive_msg: unexpected us field: "..serialize(us)); end
+		local id = tuple[3];
+		local ts = tuple[4];
+		if type(ts) ~= "table" then fatal("archive_msg: unexpected timestamp field: "..serialize(ts)); end
+		local peer     = tuple[5];
+		local bare_peer = tuple[6];
+		local packet   = tuple[7];
+		local nick     = tuple[8];
+		local msg_type = tuple[9]; -- "chat" or "groupchat"
+		if type(packet) ~= "table" then
+			warn("archive_msg: skipping record with non-stanza packet for "..tostring(us[1]).."@"..tostring(us[2]).." id="..tostring(id));
+			return;
+		end
+		archive_msg(us[1], us[2], id or "", build_time(ts), peer, bare_peer, packet, nick, msg_type or "chat");
+	end;
+	archive_prefs = function(tuple)
+		-- {archive_prefs, {User,Host}, Default, Always, Never}
+		local us = tuple[2];
+		if type(us) ~= "table" then fatal("archive_prefs: unexpected us field: "..serialize(us)); end
+		local default_policy = tuple[3] or "never";
+		local always_jids    = tuple[4] or {};
+		local never_jids     = tuple[5] or {};
+		archive_prefs(us[1], us[2], default_policy, always_jids, never_jids);
 	end;
 	--[=[config = function(tuple)
 		if tuple[2] == "hosts" then
