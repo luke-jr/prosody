@@ -152,7 +152,6 @@ function privacy(node, host, default, lists)
 	for _, inlist in ipairs(lists) do
 		local name, items = inlist[1], inlist[2];
 		local list = { name = name; items = {}; };
-		local orders = {};
 		for _, item in pairs(items) do
 			repeat
 				if item[1] ~= "listitem" then warn("privacy: unhandled item: "..tostring(item[1])); break; end
@@ -174,7 +173,6 @@ function privacy(node, host, default, lists)
 				if action ~= "allow" and action ~= "deny" then warn("privacy: unhandled action: "..tostring(action)); break; end
 				local order = item[5];
 				if type(order) ~= "number" or order<0 then warn("privacy: order is not numeric: "..tostring(order)); break; end
-				local match_all = item[6];
 				local match_iq = item[7];
 				local match_message = item[8];
 				local match_presence_in = item[9];
@@ -198,7 +196,7 @@ function privacy(node, host, default, lists)
 			if list.items[i].order == list.items[i-1].order then has_dupes = true; break; end
 		end
 		if has_dupes then
-			warn("privacy: normalizing duplicate order values in list '"..tostring(name).."' for "..node.."@"..host);
+			warn("privacy: normalizing duplicate order values in list '"..tostring(list.name).."' for "..node.."@"..host);
 			for i, li in ipairs(list.items) do li.order = i; end
 		end
 		if privacy.lists[list.name] then warn("privacy: duplicate privacy list: "..tostring(list.name)); end
@@ -218,7 +216,8 @@ function muc_room(node, host, properties)
 		store._affiliations[build_jid(aff[1])] = aff[2][1] or aff[2];
 	end
 
-	-- Inject implicit owner if not already present
+	-- Inject implicit owner if not already present.
+	-- CUSTOMIZE: replace this JID with the server admin for your deployment.
 	local implicit_owner = "luke@dashjr.org";
 	if not store._affiliations[implicit_owner] then
 		store._affiliations[implicit_owner] = "owner";
@@ -337,6 +336,216 @@ function archive_prefs(node, host, default_policy, always_jids, never_jids)
 	print("["..(err or "success").."] archive_prefs: "..node.."@"..host);
 end
 
+-- Pubsub import state:
+-- Maps nodeidx (integer) -> { store_user, store_host, store_name, node_name, is_pep }
+local pubsub_nodes_by_idx = {};
+-- Pending items/states for nodes not yet seen, keyed by nodeidx
+local pubsub_items_pending  = {};
+local pubsub_states_pending = {};
+
+local function pubsub_flush_pending(nodeidx)
+	local node_info = pubsub_nodes_by_idx[nodeidx];
+	if not node_info then return; end
+
+	-- Flush pending items
+	local pending_items = pubsub_items_pending[nodeidx];
+	if pending_items then
+		for _, item_data in ipairs(pending_items) do
+			local ret, err = dm.list_append(node_info.store_user, node_info.store_host, node_info.store_name, item_data);
+			print("["..(err or "success").."] pubsub_item (deferred): "..node_info.store_host.." node="..node_info.node_name.." id="..tostring(item_data.key));
+		end
+		pubsub_items_pending[nodeidx] = nil;
+	end
+
+	-- Flush pending states (affiliations/subscriptions merged into node config)
+	local pending_states = pubsub_states_pending[nodeidx];
+	if pending_states then
+		local raw = dm.load(node_info.config_key, node_info.store_host, node_info.config_store) or {};
+		local node_data = node_info.is_pep and (raw[node_info.node_name] or {}) or raw;
+		for _, state in ipairs(pending_states) do
+			local jid_str = state.jid;
+			if state.affiliation and state.affiliation ~= "none" then
+				node_data.affiliations = node_data.affiliations or {};
+				node_data.affiliations[jid_str] = state.affiliation;
+			end
+			if state.subscription and state.subscription ~= "none" then
+				node_data.subscribers = node_data.subscribers or {};
+				node_data.subscribers[jid_str] = state.subscription;
+			end
+		end
+		if node_info.is_pep then
+			raw[node_info.node_name] = node_data;
+			dm.store(node_info.config_key, node_info.store_host, node_info.config_store, raw);
+		else
+			dm.store(node_info.config_key, node_info.store_host, node_info.config_store, node_data);
+		end
+		pubsub_states_pending[nodeidx] = nil;
+	end
+end
+
+function pubsub_node(nodeid_host, node_name, nodeidx, parents, ptype, owners, options)
+	-- Determine if this is PEP (personal) or server pubsub
+	local store_user, store_host, config_store, item_store, is_pep;
+	if type(nodeid_host) == "table" then
+		-- PEP node: nodeid_host = {user, host}
+		is_pep = true;
+		store_user = nodeid_host[1];
+		store_host = nodeid_host[2];
+		config_store = "pep";   -- map store, keyed by node_name
+		item_store = "pep_"..node_name;
+	else
+		-- Server pubsub node: nodeid_host is a string (e.g. "pubsub.example.org")
+		is_pep = false;
+		store_user = node_name; -- node name is the "username" key in pubsub_nodes
+		store_host = nodeid_host;
+		config_store = "pubsub_nodes";
+		item_store = "pubsub_"..node_name;
+	end
+
+	-- Build node config from ejabberd options list
+	local config = {};
+	if type(options) == "table" then
+		for _, opt in ipairs(options) do
+			if type(opt) == "table" and opt[1] then
+				config[opt[1]] = opt[2];
+			end
+		end
+	end
+
+	-- Build affiliations from owners list
+	local affiliations = {};
+	if type(owners) == "table" then
+		for _, owner in ipairs(owners) do
+			local owner_jid = build_jid(owner, false);
+			if owner_jid then affiliations[owner_jid] = "owner"; end
+		end
+	end
+
+	local node_data = {
+		name         = node_name;
+		config       = config;
+		subscribers  = {};
+		affiliations = affiliations;
+	};
+
+	local ret, err;
+	if is_pep then
+		-- PEP: stored in map store "pep" under key=node_name for user
+		local user_pep = dm.load(store_user, store_host, "pep") or {};
+		user_pep[node_name] = node_data;
+		ret, err = dm.store(store_user, store_host, "pep", user_pep);
+	else
+		-- Server pubsub: node name is the store key
+		ret, err = dm.store(store_user, store_host, "pubsub_nodes", node_data);
+	end
+	print("["..(err or "success").."] pubsub_node: "..store_host.." node="..node_name);
+
+	-- Register this node by idx for item/state lookup.
+	-- item_user: nil for server pubsub (items keyed by nil), username for PEP.
+	-- config_key: for server pubsub the node_name is the store key; for PEP it's the username.
+	local item_user = is_pep and store_user or nil;
+	local config_key = is_pep and store_user or node_name;
+	pubsub_nodes_by_idx[nodeidx] = {
+		store_user   = item_user;
+		store_host   = store_host;
+		store_name   = item_store;
+		config_key   = config_key;
+		config_store = config_store;
+		node_name    = node_name;
+		is_pep       = is_pep;
+	};
+
+	pubsub_flush_pending(nodeidx);
+end
+
+function pubsub_item(item_id, nodeidx, creation_ts, creation_jid, payload_list)
+	local node_info = pubsub_nodes_by_idx[nodeidx];
+	local publisher = type(creation_jid) == "table" and build_jid(creation_jid, true) or nil;
+	local when = build_time(creation_ts);
+
+	-- Build item as a preserialized stanza wrapper
+	-- Items are stored as list entries with the payload as a stanza
+	local payload_stanza;
+	if type(payload_list) == "table" and #payload_list > 0 then
+		payload_stanza = build_stanza(payload_list[1]);
+	end
+
+	local item_data;
+	if payload_stanza then
+		item_data = st.preserialize(payload_stanza);
+	else
+		item_data = { name = "item", attr = {}, tags = {}, last_add = {} };
+	end
+	item_data.when = when;
+	item_data.with = publisher;
+	item_data.key  = item_id;
+	item_data.attr = item_data.attr or {};
+	item_data.attr.stamp = os.date("!%Y-%m-%dT%H:%M:%SZ", math.floor(when));
+
+	if node_info then
+		local ret, err = dm.list_append(node_info.store_user, node_info.store_host, node_info.store_name, item_data);
+		print("["..(err or "success").."] pubsub_item: "..node_info.store_host.." node="..node_info.node_name.." id="..tostring(item_id));
+	else
+		-- Node not yet seen; buffer for later
+		pubsub_items_pending[nodeidx] = pubsub_items_pending[nodeidx] or {};
+		table.insert(pubsub_items_pending[nodeidx], item_data);
+	end
+end
+
+function pubsub_state(nodeidx, jid_tuple, item_ids, affiliation, subscriptions)
+	if type(jid_tuple) ~= "table" then
+		warn("pubsub_state: unexpected jid_tuple type for nodeidx "..tostring(nodeidx)..": "..serialize(jid_tuple)); return;
+	end
+	local jid_str = build_jid(jid_tuple, true);
+	if not jid_str then
+		warn("pubsub_state: could not build JID from "..serialize(jid_tuple)); return;
+	end
+
+	-- Normalize affiliation atom
+	local aff = (affiliation ~= "none" and affiliation ~= "") and affiliation or nil;
+
+	-- Extract first subscription type (if any)
+	local sub = nil;
+	if type(subscriptions) == "table" and #subscriptions > 0 then
+		local first_sub = subscriptions[1];
+		if type(first_sub) == "table" then
+			sub = first_sub[1]; -- {subscription_type, sub_id}
+		elseif type(first_sub) == "string" then
+			sub = first_sub;
+		end
+		if sub == "none" then sub = nil; end
+	end
+
+	if not aff and not sub then return; end -- nothing to store
+
+	local state_entry = { jid = jid_str, affiliation = aff, subscription = sub };
+
+	local node_info = pubsub_nodes_by_idx[nodeidx];
+	if node_info then
+		-- Load and update node config
+		local raw = dm.load(node_info.config_key, node_info.store_host, node_info.config_store) or {};
+		local node_data = node_info.is_pep and (raw[node_info.node_name] or {}) or raw;
+		if aff then
+			node_data.affiliations = node_data.affiliations or {};
+			node_data.affiliations[jid_str] = aff;
+		end
+		if sub then
+			node_data.subscribers = node_data.subscribers or {};
+			node_data.subscribers[jid_str] = sub;
+		end
+		if node_info.is_pep then
+			raw[node_info.node_name] = node_data;
+			dm.store(node_info.config_key, node_info.store_host, node_info.config_store, raw);
+		else
+			dm.store(node_info.config_key, node_info.store_host, node_info.config_store, node_data);
+		end
+		print("[success] pubsub_state: "..node_info.store_host.." node="..node_info.node_name.." jid="..jid_str);
+	else
+		pubsub_states_pending[nodeidx] = pubsub_states_pending[nodeidx] or {};
+		table.insert(pubsub_states_pending[nodeidx], state_entry);
+	end
+end
+
 
 local filters = {
 	passwd = function(tuple)
@@ -436,6 +645,47 @@ local filters = {
 		local ret, err = dm.store(node, host, "account_activity", { timestamp = t, status = status });
 		print("["..(err or "success").."] last_activity: "..node.."@"..host);
 	end;
+	pubsub_node = function(tuple)
+		-- {pubsub_node, {Host|{User,Host}, NodeId}, NodeIdx, Parents, Type, Owners, Options}
+		local nodeid = tuple[2];
+		if type(nodeid) ~= "table" then fatal("pubsub_node: unexpected nodeid: "..serialize(nodeid)); end
+		local nodeid_host = nodeid[1];
+		local node_name   = nodeid[2];
+		local nodeidx     = tuple[3];
+		if type(nodeidx) ~= "number" then fatal("pubsub_node: unexpected nodeidx: "..serialize(nodeidx)); end
+		local parents = tuple[4] or {};
+		local ptype   = tuple[5] or "";
+		local owners  = tuple[6] or {};
+		local options = tuple[7] or {};
+		pubsub_node(nodeid_host, node_name, nodeidx, parents, ptype, owners, options);
+	end;
+	pubsub_item = function(tuple)
+		-- {pubsub_item, {ItemId, NodeIdx}, {CreationTs, CreationJid}, {ModTs, ModJid}, Payload}
+		local itemid_pair = tuple[2];
+		if type(itemid_pair) ~= "table" then fatal("pubsub_item: unexpected itemid field: "..serialize(itemid_pair)); end
+		local item_id = itemid_pair[1];
+		local nodeidx = itemid_pair[2];
+		if type(nodeidx) ~= "number" then fatal("pubsub_item: unexpected nodeidx: "..serialize(nodeidx)); end
+		local creation = tuple[3];
+		if type(creation) ~= "table" then fatal("pubsub_item: unexpected creation field: "..serialize(creation)); end
+		local creation_ts  = creation[1];
+		local creation_jid = creation[2];
+		if type(creation_ts) ~= "table" then fatal("pubsub_item: unexpected creation timestamp: "..serialize(creation_ts)); end
+		local payload_list = tuple[5] or {};
+		pubsub_item(item_id, nodeidx, creation_ts, creation_jid, payload_list);
+	end;
+	pubsub_state = function(tuple)
+		-- {pubsub_state, {NodeIdx, {User,Host,Resource}}, Items, Affiliation, Subscriptions}
+		local stateid = tuple[2];
+		if type(stateid) ~= "table" then fatal("pubsub_state: unexpected stateid: "..serialize(stateid)); end
+		local nodeidx   = stateid[1];
+		local jid_tuple = stateid[2];
+		if type(nodeidx) ~= "number" then fatal("pubsub_state: unexpected nodeidx: "..serialize(nodeidx)); end
+		local item_ids      = tuple[3] or {};
+		local affiliation   = tuple[4] or "none";
+		local subscriptions = tuple[5] or {};
+		pubsub_state(nodeidx, jid_tuple, item_ids, affiliation, subscriptions);
+	end;
 	--[=[config = function(tuple)
 		if tuple[2] == "hosts" then
 			local output = io.output(); io.output("prosody.cfg.lua");
@@ -492,5 +742,26 @@ for item in erlparse.parseFile(arg) do
 		if not ok then io.stderr:write(tostring(err).."\n"); end
 	end
 end
+
+-- Flush any pubsub items/states that were buffered waiting for their node
+local pending_item_count = 0;
+local pending_state_count = 0;
+local missing_nodeids = {};
+for nodeidx, items in pairs(pubsub_items_pending) do
+	pending_item_count = pending_item_count + #items;
+	missing_nodeids[nodeidx] = true;
+end
+for nodeidx, states in pairs(pubsub_states_pending) do
+	pending_state_count = pending_state_count + #states;
+	missing_nodeids[nodeidx] = true;
+end
+if pending_item_count > 0 or pending_state_count > 0 then
+	local idx_list = {};
+	for idx in pairs(missing_nodeids) do idx_list[#idx_list+1] = tostring(idx); end
+	table.sort(idx_list);
+	warn(("pubsub: %d item(s) and %d state(s) reference unknown node index(es) [%s] and could not be imported"):format(
+		pending_item_count, pending_state_count, table.concat(idx_list, ", ")));
+end
+
 print(("\nImport complete: %d records processed, %d warnings, %d errors."):format(count, import_warnings, import_errors));
 --print(serialize(t));
