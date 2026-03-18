@@ -35,6 +35,10 @@ local function warn(msg)
 	import_warnings = import_warnings + 1;
 	io.stderr:write("[warn] "..msg.."\n");
 end
+local function err(msg)
+	import_errors = import_errors + 1;
+	io.stderr:write("[error] "..msg.."\n");
+end
 local function info(msg)
 	io.stderr:write("[info] "..msg.."\n");
 end
@@ -154,14 +158,12 @@ function privacy(node, host, default, lists)
 	for _, inlist in ipairs(lists) do
 		local name, items = inlist[1], inlist[2];
 		local list = { name = name; items = {}; };
-		local orders = {};
-		local max_order = -1;
 		for _, item in pairs(items) do
 			repeat
-				if item[1] ~= "listitem" then print("[error] privacy: unhandled item: "..tostring(item[1])); break; end
+				if item[1] ~= "listitem" then err("privacy: unhandled item: "..tostring(item[1])); break; end
 				local _type, value = item[2], item[3];
 				if _type == "jid" then
-					if type(value) ~= "table" then print("[error] privacy: jid value is not valid: "..tostring(value)); break; end
+					if type(value) ~= "table" then err("privacy: jid value is not valid: "..tostring(value)); break; end
 					value = build_jid(value, true)
 				elseif _type == "none" then
 					_type = nil;
@@ -177,15 +179,6 @@ function privacy(node, host, default, lists)
 				if action ~= "allow" and action ~= "deny" then warn("privacy: unhandled action: "..tostring(action)); break; end
 				local order = item[5];
 				if type(order) ~= "number" or order<0 then warn("privacy: order is not numeric: "..tostring(order)); break; end
-				if orders[order] then
-					-- Duplicate order: normalize by assigning next available value
-					warn("privacy: normalizing duplicate order value "..tostring(order).." in list '"..tostring(name).."' for "..node.."@"..host);
-					max_order = max_order + 1;
-					while orders[max_order] do max_order = max_order + 1; end
-					order = max_order;
-				end
-				if order > max_order then max_order = order; end
-				orders[order] = true;
 				local match_iq = item[7];
 				local match_message = item[8];
 				local match_presence_in = item[9];
@@ -203,6 +196,13 @@ function privacy(node, host, default, lists)
 			until true;
 		end
 		table.sort(list.items, function(a, b) return a.order < b.order; end);
+		-- Bump any duplicate order values forward to maintain sorted order
+		for i = 2, #list.items do
+			if list.items[i].order <= list.items[i-1].order then
+				warn("privacy: normalizing duplicate order value in list '"..tostring(name).."' for "..node.."@"..host);
+				list.items[i].order = list.items[i-1].order + 1;
+			end
+		end
 		if privacy.lists[list.name] then warn("privacy: duplicate privacy list: "..tostring(list.name)); end
 		privacy.lists[list.name] = list;
 		count = count + 1;
@@ -316,8 +316,12 @@ function archive_msg(us_node, us_host, id, t, peer, bare_peer, packet, nick, msg
 			warn("archive_msg: room "..us_node.."@"..us_host.." has mam=false but archive data exists; importing anyway");
 			muc_mam_disabled[us_node.."@"..us_host] = nil; -- warn once
 		end
-		-- 'with' for MUC archive is the sender's full JID
-		item.with = build_jid(peer, true);
+		-- 'with' for MUC archive is the sender's bare JID
+		item.with = build_jid(bare_peer, false);
+		-- 'from' for MUC archive is the occupant JID (room@host/nick) when nick is known
+		if type(nick) == "string" and nick ~= "" then
+			item.attr.from = us_node.."@"..us_host.."/"..nick;
+		end
 	else
 		-- Personal MAM: stored under the user's archive store
 		store_user = us_node;
@@ -780,7 +784,7 @@ if pending_item_count > 0 or pending_state_count > 0 then
 	local idx_list = {};
 	for idx in pairs(missing_nodeids) do idx_list[#idx_list+1] = tostring(idx); end
 	table.sort(idx_list);
-	warn(("pubsub: %d item(s) and %d state(s) reference unknown node index(es) [%s] and could not be imported"):format(
+	err(("pubsub: %d item(s) and %d state(s) reference unknown node index(es) [%s] and could not be imported"):format(
 		pending_item_count, pending_state_count, table.concat(idx_list, ", ")));
 end
 
