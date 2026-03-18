@@ -35,6 +35,9 @@ local function warn(msg)
 	import_warnings = import_warnings + 1;
 	io.stderr:write("[warn] "..msg.."\n");
 end
+local function info(msg)
+	io.stderr:write("[info] "..msg.."\n");
+end
 local function fatal(msg)
 	import_errors = import_errors + 1;
 	error("[fatal] "..msg, 2);
@@ -65,12 +68,16 @@ function build_stanza(tuple, stanza)
 	end
 end
 function build_time(tuple)
-	local Megaseconds, Seconds, Microseconds = unpack(tuple);
+	local Megaseconds,Seconds,Microseconds = unpack(tuple);
 	if type(Megaseconds) ~= "number" or type(Seconds) ~= "number" then
 		fatal("build_time: unexpected timestamp format: "..serialize(tuple));
 	end
 	local t = Megaseconds * 1000000 + Seconds;
-	if type(Microseconds) == "number" and Microseconds > 0 then
+	if Microseconds == nil then
+		-- no microseconds field; that's fine
+	elseif type(Microseconds) ~= "number" then
+		fatal("build_time: unexpected microseconds type: "..type(Microseconds).." in "..serialize(tuple));
+	elseif Microseconds > 0 then
 		t = t + Microseconds / 1000000;
 	end
 	return t;
@@ -105,17 +112,12 @@ function password(node, host, password)
 		data.server_key = hex(unb64(password[3]));
 		data.salt = unb64(password[4]);
 		if type(password[6]) == "number" then
-			if password[5] ~= "sha" then
-				fatal("passwd: unexpected SCRAM hash algorithm: "..tostring(password[5]).." for "..node.."@"..host);
-			end
+			assert(password[5] == "sha", "unexpected passwd entry hash: "..tostring(password[5]));
 			data.iteration_count = password[6];
-		elseif type(password[5]) == "number" then
-			data.iteration_count = password[5];
 		else
-			fatal("passwd: unexpected SCRAM iteration_count fields for "..node.."@"..host..": "..serialize(password));
+			assert(type(password[5]) == "number", "unexpected passwd entry in source data");
+			data.iteration_count = password[5];
 		end
-	else
-		fatal("passwd: unexpected password/auth shape for "..node.."@"..host..": "..serialize(password));
 	end
 	local ret, err = dm.store(node, host, "accounts", data);
 	print("["..(err or "success").."] accounts: "..node.."@"..host);
@@ -152,12 +154,14 @@ function privacy(node, host, default, lists)
 	for _, inlist in ipairs(lists) do
 		local name, items = inlist[1], inlist[2];
 		local list = { name = name; items = {}; };
+		local orders = {};
+		local max_order = -1;
 		for _, item in pairs(items) do
 			repeat
-				if item[1] ~= "listitem" then warn("privacy: unhandled item: "..tostring(item[1])); break; end
+				if item[1] ~= "listitem" then print("[error] privacy: unhandled item: "..tostring(item[1])); break; end
 				local _type, value = item[2], item[3];
 				if _type == "jid" then
-					if type(value) ~= "table" then warn("privacy: jid value is not valid: "..tostring(value)); break; end
+					if type(value) ~= "table" then print("[error] privacy: jid value is not valid: "..tostring(value)); break; end
 					value = build_jid(value, true)
 				elseif _type == "none" then
 					_type = nil;
@@ -173,6 +177,15 @@ function privacy(node, host, default, lists)
 				if action ~= "allow" and action ~= "deny" then warn("privacy: unhandled action: "..tostring(action)); break; end
 				local order = item[5];
 				if type(order) ~= "number" or order<0 then warn("privacy: order is not numeric: "..tostring(order)); break; end
+				if orders[order] then
+					-- Duplicate order: normalize by assigning next available value
+					warn("privacy: normalizing duplicate order value "..tostring(order).." in list '"..tostring(name).."' for "..node.."@"..host);
+					max_order = max_order + 1;
+					while orders[max_order] do max_order = max_order + 1; end
+					order = max_order;
+				end
+				if order > max_order then max_order = order; end
+				orders[order] = true;
 				local match_iq = item[7];
 				local match_message = item[8];
 				local match_presence_in = item[9];
@@ -190,15 +203,6 @@ function privacy(node, host, default, lists)
 			until true;
 		end
 		table.sort(list.items, function(a, b) return a.order < b.order; end);
-		-- Detect and normalize duplicate order values by renumbering sequentially
-		local has_dupes = false;
-		for i = 2, #list.items do
-			if list.items[i].order == list.items[i-1].order then has_dupes = true; break; end
-		end
-		if has_dupes then
-			warn("privacy: normalizing duplicate order values in list '"..tostring(list.name).."' for "..node.."@"..host);
-			for i, li in ipairs(list.items) do li.order = i; end
-		end
 		if privacy.lists[list.name] then warn("privacy: duplicate privacy list: "..tostring(list.name)); end
 		privacy.lists[list.name] = list;
 		count = count + 1;
@@ -221,26 +225,43 @@ function muc_room(node, host, properties)
 	local implicit_owner = "luke@dashjr.org";
 	if not store._affiliations[implicit_owner] then
 		store._affiliations[implicit_owner] = "owner";
-		warn("muc_room: injected implicit owner "..implicit_owner.." for "..node.."@"..host);
+		info("muc_room: injected implicit owner "..implicit_owner.." for "..node.."@"..host);
 	end
 
 	-- Robustly handle multiple subject formats seen in ejabberd dumps:
 	-- 1. Empty list {} -> no subject
 	-- 2. Direct string -> subject as-is
-	-- 3. [{text, lang, text_value}] -> extract text_value
+	-- 3. [{text, lang, text_value}] -> extract text_value (only single-item list expected)
 	local subject_raw = properties.subject;
 	if type(subject_raw) == "string" and subject_raw ~= "" then
 		store._data.subject = subject_raw;
-	elseif type(subject_raw) == "table" and #subject_raw > 0 then
-		local first = subject_raw[1];
-		if type(first) == "table" and first[1] == "text" and type(first[3]) == "string" then
-			if first[3] ~= "" then store._data.subject = first[3]; end
-		elseif type(first) == "string" and first ~= "" then
-			store._data.subject = first;
+	elseif type(subject_raw) == "table" then
+		if #subject_raw == 0 then
+			-- empty list -> no subject
+		elseif #subject_raw == 1 then
+			local first = subject_raw[1];
+			if type(first) == "table" and first[1] == "text"
+			    and (first[2] == nil or type(first[2]) == "string")
+			    and type(first[3]) == "string" then
+				if first[3] ~= "" then store._data.subject = first[3]; end
+			elseif type(first) == "string" and first ~= "" then
+				store._data.subject = first;
+			else
+				warn("muc_room: unrecognized subject item format: "..serialize(first).." in "..node.."@"..host);
+			end
 		else
-			warn("muc_room: unrecognized subject item format: "..serialize(first).." in "..node.."@"..host);
+			-- Multiple items unexpected; use first text value and warn
+			warn("muc_room: subject has "..#subject_raw.." items (expected 0 or 1); using first in "..node.."@"..host);
+			local first = subject_raw[1];
+			if type(first) == "table" and first[1] == "text"
+			    and (first[2] == nil or type(first[2]) == "string")
+			    and type(first[3]) == "string" then
+				if first[3] ~= "" then store._data.subject = first[3]; end
+			elseif type(first) == "string" and first ~= "" then
+				store._data.subject = first;
+			end
 		end
-	end -- else: empty table -> no subject
+	end
 
 	if properties.subject_author and properties.subject_author ~= "" then
 		store._data.subject_from = store.jid .. "/" .. properties.subject_author;
