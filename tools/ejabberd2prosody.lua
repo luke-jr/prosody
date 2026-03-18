@@ -421,6 +421,21 @@ local filters = {
 		local never_jids     = tuple[5] or {};
 		archive_prefs(us[1], us[2], default_policy, always_jids, never_jids);
 	end;
+	last_activity = function(tuple)
+		-- {last_activity, {User,Host}, Timestamp, Status}
+		local us = tuple[2];
+		if type(us) ~= "table" then fatal("last_activity: unexpected us field: "..serialize(us)); end
+		local node, host = us[1], us[2];
+		local t = tuple[3];
+		if type(t) ~= "number" then
+			fatal("last_activity: unexpected timestamp type for "..tostring(node).."@"..tostring(host)..": "..serialize(t));
+		end
+		local status = tuple[4];
+		if type(status) ~= "string" then status = ""; end
+		-- Store into account_activity store (used by mod_account_activity)
+		local ret, err = dm.store(node, host, "account_activity", { timestamp = t, status = status });
+		print("["..(err or "success").."] last_activity: "..node.."@"..host);
+	end;
 	--[=[config = function(tuple)
 		if tuple[2] == "hosts" then
 			local output = io.output(); io.output("prosody.cfg.lua");
